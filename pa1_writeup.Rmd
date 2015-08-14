@@ -1,0 +1,313 @@
+---
+title: 'Practical Machine Learning: Prediction Assignment - Writeup'
+author: "A. U."
+date: '2015-08-14'
+output:
+  html_document: default
+  pdf_document:
+    fig_caption: yes
+---
+
+## Executive Summary
+
+The goal of this project is to predict the manner (correctly and incorrectly in 5 different ways) in which they did the exercise (barbell lifts). This is the "classe" variable in the training set, the whole of which we explore first. After removing irrelevant features and noise from the data, we proceed to build 7 models. Using cross validation against a held-out portion of the training data, we determine the out of sample error by measuring the effective accuracy. Finally, we use the best prediction model (random forests) to predict 20 different test cases and perform a second validation. 
+
+## Data loading and preprocessing
+
+We first load the data provided at http://groupware.les.inf.puc-rio.br/har. The R code provided expects to find the CSV files in its current working directory.
+
+Unfortunately, there was no clear codebook available (apart from indirect hints in the paper on the same website), which is why we will have to some extra data exploration before we can start building models.
+
+```{r}
+library(lubridate)
+pml.training <- read.csv("pml-training.csv", row.names=1, na.strings=c("NA", "#DIV/0!", ""))
+pml.testing <- read.csv("pml-testing.csv", row.names=1, na.strings=c("NA", "#DIV/0!", ""))
+pml.training$cvtd_timestamp <- mdy_hm(pml.training$cvtd_timestamp)
+pml.testing$cvtd_timestamp <- mdy_hm(pml.testing$cvtd_timestamp)
+```
+
+A first look at the data reveals that 100 variables in the testing set only contain NAs.
+
+Since we ultimately intend to predict cases from the testing set provided, we eliminate all potential predictor columns in the training and testing set which only contain NAs or other unusable values in the testing set.
+
+```{r}
+set.seed(2407)
+rmcols1 <- colnames(pml.testing[, colSums(!is.na(pml.testing)) != nrow(pml.testing)])
+rmcols1 <- append(rmcols1, colnames(pml.training[,c(2:3,5)]))
+df1.train <- pml.training[,-which(names(pml.training) %in% rmcols1)]
+df1.test  <- pml.testing[,-which(names(pml.testing) %in% rmcols1)]
+summary(df1.train)
+```
+
+Upon inspection of the variable summary it becomes obvious that the predictors are not well centered and that the scaling of the measurements also appears to be a problem. We will have to address these two issues in the preprocessing of the model training later on. 
+
+In addition, we convert the predictors that were imported as integers into numeric data types for later correlation analysis.
+
+```{r}
+intcols <- as.vector(sapply(df1.train,class)) %in% "integer"
+df1.train[,intcols] <- as.data.frame(sapply(df1.train[,intcols],as.numeric))
+intcols <- as.vector(sapply(df1.test,class)) %in% "integer"
+df1.test[,intcols] <- as.data.frame(sapply(df1.test[,intcols],as.numeric))
+```
+
+Let's explore the available numeric features by plotting them against the outcome class.
+
+```{r fig.width=16,fig.height=16,warning=FALSE,message=FALSE,include=TRUE,fig.cap="Plot of all features vs. outcome"}
+library(caret)
+numcols <- as.vector(sapply(df1.train,class)) %in% "numeric"
+featurePlot(x = df1.train[, numcols],
+            y = df1.train$classe,
+            plot = "box",
+            ## Pass in options to bwplot() 
+            scales = list(y = list(relation="free"),
+                          x = list(rot = 90))
+                        )
+```
+
+As can be gathered from the above plot, some of the numeric predictors have little variance while others seem to have captured some outliers around an otherwise centered median value. Due to this, we will check whether the predictors are normally distributed.
+
+To ensure optimal performance of our model building efforts, we losely follow the guide provided by the caret package maintainers at https://topepo.github.io/caret/preprocess.html and apply some of their preprocessing suggestions. Let's check for zero- or near-zero-variance predictors first and remove columns with little predictive value.
+
+```{r}
+library(caret)
+set.seed(2407)
+outvar <- ncol(df1.train)
+nzv <- nearZeroVar(df1.train[,-outvar], saveMetrics=TRUE)
+nzv[nzv$nzv,]
+rmcols2 <- rownames(nzv[nzv$nzv,])
+if(length(rmcols2) > 0) {
+  df1.train <- df1.train[,-which(names(df1.train) %in% rmcols2)]
+  df1.test <- df1.test[,-which(names(df1.test) %in% rmcols2)]
+  }
+```
+
+We also check the data for correlated predictors which can potentially be removed. We set the threshold for this to 90% correlation.
+
+```{r}
+numcols <- as.vector(sapply(df1.train,class)) %in% "numeric"
+descrCor <-  cor(df1.train[,numcols])
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .90)
+rmcols3 <- names(df1.train[,highlyCorDescr])
+rmcols3
+if(length(rmcols3) > 0) {
+  df1.train <- df1.train[,-which(names(df1.train) %in% rmcols3)]
+  df1.test <- df1.test[,-which(names(df1.test) %in% rmcols3)]
+  }
+```
+
+Considering the feature plot above, an additional problem might be that the predictors are not normally distributed. To check for this we perform the Shapiro-Test on a 5k-sample of the actual predictors. The limitation to the 5k sample of the training data is mandated by the Shapiro test.
+
+```{r}
+set.seed(2407)
+df1.train.5k <- df1.train[sample(nrow(df1.train),replace=F,size=5000),]
+outvar <- ncol(df1.train)
+predcols <- as.vector(sapply(df1.train.5k,class)) %in% "numeric"
+swtest <- sapply(df1.train.5k[,predcols], shapiro.test)
+pvalmax <- max(as.numeric(swtest[2,]))
+#pvalmax <- 0
+```
+
+The predictors in the training data seem to be normally distributed, judging by the maximum p-value of `r pvalmax`. This frees us from having to perform additional preprocessing like the BoxCox-transform on the training data.
+
+Finally, we split the original training data into two sets, one for actually training our model and the other for testing. The split ratio is 60:40 for training:testing. To avoid naming confusion, we also put the original PML-testing set into a separate data frame for final validation of our models by predicting the outcome and submitting it to the server for verification.
+
+```{r}
+library(caret)
+set.seed(2407)
+inTrain <- createDataPartition(df1.train$classe, p=0.6, list=FALSE)
+df2.train <- df1.train[inTrain,]
+df2.test  <- df1.train[-inTrain,]
+df2.val   <- df1.test
+```
+
+
+## Model training
+
+We will train a total of 7 models using very commonly used and recommended methods: Classification trees, neural networks, supporting vector machines, boosted trees, linear discriminant model, random forests and k-nearest-neighbors.
+
+As discussed above, the features in this dataset appear to have some issues regarding centering and scaling, which can easily be fixed by adding the appropriate preprocessing parameters when training the models. We also considered performing a PCA, but decided against it due to the much reduced interpretability of the resulting models.
+
+```{r, warning=FALSE,message=FALSE}
+library(caret)
+set.seed(2407)
+if (file.exists("fitrpart.Rds")) {
+  fit.rpart <- readRDS("fitrpart.Rds")
+} else {
+  fit.rpart <- train(classe ~ .
+                 ,data = df2.train
+                 ,preProcess = c("center", "scale")
+                 ,method = "rpart"
+                 ,na.action = "na.omit"
+                 )
+  saveRDS(fit.rpart, file="fitrpart.Rds")
+}
+
+if (file.exists("fitnnet.Rds")) {
+  fit.nnet <- readRDS("fitnnet.Rds")
+} else {
+  fit.nnet <- train(classe ~ .
+                 ,data = df2.train
+                 ,preProcess = c("center", "scale")
+                 ,method = "nnet"
+                 ,na.action = "na.omit"
+                 ,trace = FALSE
+                 )
+  saveRDS(fit.nnet, file="fitnnet.Rds")
+}
+
+if (file.exists("fitsvm.Rds")) {
+  fit.svm <- readRDS("fitsvm.Rds")
+} else {
+  fit.svm <- train(classe ~ .
+                 ,data = df2.train
+                 ,preProcess = c("center", "scale")
+                 ,method = "svmLinear"
+                 ,na.action = "na.omit"
+                 )
+  saveRDS(fit.svm, file="fitsvm.Rds")
+}
+
+if (file.exists("fitgbm.Rds")) {
+  fit.gbm <- readRDS("fitgbm.Rds")
+} else {
+  fit.gbm <- train(classe ~ .
+                 ,data = df2.train
+                 ,preProcess = c("center", "scale")
+                 ,method = "gbm"
+                 ,na.action = "na.omit"
+                 ,verbose = FALSE
+                 )
+  saveRDS(fit.gbm, file="fitgbm.Rds")
+}
+
+if (file.exists("fitlda.Rds")) {
+  fit.lda <- readRDS("fitlda.Rds")
+} else {
+  fit.lda <- train(classe ~ .
+                 ,data = df2.train
+                 ,preProcess = c("center", "scale")
+                 ,method = "lda"
+                 ,na.action = "na.omit"
+                 )
+  saveRDS(fit.lda, file="fitlda.Rds")
+}
+
+if (file.exists("fitrf.Rds")) {
+  fit.rf <- readRDS("fitrf.Rds")
+} else {
+  fit.rf <- train(classe ~ .
+                 ,data = df2.train
+                 ,preProcess = c("center", "scale")
+                 ,method = "rf"
+                 ,na.action = "na.omit"
+                 )
+  saveRDS(fit.rf, file="fitrf.Rds")
+}
+
+if (file.exists("fitknn.Rds")) {
+  fit.knn <- readRDS("fitknn.Rds")
+} else {
+  fit.knn <- train(classe ~ .
+                 ,data = df2.train
+                 ,preProcess = c("center", "scale")
+                 ,method = "knn"
+                 ,na.action = "na.omit"
+                 )
+  saveRDS(fit.knn, file="fitknn.Rds")
+}
+```
+
+It is noteworthy that the training time differs quite considerably between the methods, with random forests and neural networks taking the longest by far. This also is the reason for the caching we perform using loadRDS and saveRDS to save time during the compilation of this report.
+
+## Model evaluation
+
+To evaluate the models we compare their predictions with the data from the held out test data we put aside earlier on (40% of the original training data). Since the outcome is a factor variable, we will be using the accuracy as the benchmarking metric.
+
+```{r, warning=FALSE,message=FALSE}
+library(caret)
+set.seed(2407)
+cm.rpart <- confusionMatrix(predict(fit.rpart, df2.test), df2.test$classe)
+cm.nnet <-  confusionMatrix(predict(fit.nnet,  df2.test), df2.test$classe)
+cm.svm <-   confusionMatrix(predict(fit.svm,   df2.test), df2.test$classe)
+cm.gbm <-   confusionMatrix(predict(fit.gbm,   df2.test), df2.test$classe)
+cm.lda <-   confusionMatrix(predict(fit.lda,   df2.test), df2.test$classe)
+cm.rf <-    confusionMatrix(predict(fit.rf,    df2.test), df2.test$classe)
+cm.knn <-   confusionMatrix(predict(fit.knn,   df2.test), df2.test$classe)
+```
+
+To summarize the results of our model building efforts, we compile the method and its accuracy into a small plot.
+
+```{r}
+results <- as.data.frame(c(fit.rpart$method
+                         , fit.nnet$method
+                         , fit.svm$method
+                         , fit.gbm$method
+                         , fit.lda$method
+                         , fit.rf$method
+                         , fit.knn$method
+                           ))
+results$acc <-           (c(cm.rpart$overall[1]
+                          , cm.nnet$overall[1]
+                          , cm.svm$overall[1]
+                          , cm.gbm$overall[1]
+                          , cm.lda$overall[1]
+                          , cm.rf$overall[1]
+                          , cm.knn$overall[1]
+                          ))
+results$acc <- round(results$acc, 2)
+names(results) <- c("Method", "Accuracy Test")
+results
+plot(results$Method, results$`Accuracy Test`, xlab="Method", ylab="Accuracy with Test data")
+```
+
+The plot shows that the field of top performing methods (all above 90% accuracy) is lead by random forests (rf), which clearly outperforms all other methods, but is closely followed by the boosted tree model (gbm). The k-nearest-neighbors method (knn) also works very well with 95+ % accuracy. 
+
+The second group of methods (between 70 and 80% accuracy) consists of supporting vector machines (svmLinear), neural networks (nnet) and linear discriminant analysis (lda). 
+
+Last (and in fact least) we have the traditional classification tree (rpart), which really struggled to achieve accuracy above 50%, rendering it unsuitable for any sort of prediction in combination with the data at hand.
+
+## Prediction and verification
+
+To complete the final task of predicting the outcome of the 20 test cases for submission, we proceed with the 3 best performing models as discussed above.
+
+```{r}
+pred.rf    <- predict(fit.rf,    df2.val)
+pred.gbm   <- predict(fit.gbm,   df2.val)
+pred.knn   <- predict(fit.knn,   df2.val)
+pred.svm   <- predict(fit.svm,   df2.val)
+pred.nnet  <- predict(fit.nnet,  df2.val)
+pred.lda   <- predict(fit.knn,   df2.val)
+pred.rpart <- predict(fit.rpart, df2.val)
+```
+
+We submitted the predicitions provided by the random forests method and 100% of them were verified as correct, as we had hoped. We therefore set these predictions as the benchmark and check how well the other methods did in this real world scenario.
+
+```{r, warning=FALSE,message=FALSE}
+library(calibrate)
+cm2.rpart <- confusionMatrix(pred.rpart, pred.rf)
+cm2.nnet <-  confusionMatrix(pred.nnet,  pred.rf)
+cm2.svm <-   confusionMatrix(pred.svm,   pred.rf)
+cm2.gbm <-   confusionMatrix(pred.gbm,   pred.rf)
+cm2.lda <-   confusionMatrix(pred.lda,   pred.rf)
+cm2.rf <-    confusionMatrix(pred.rf,    pred.rf)
+cm2.knn <-   confusionMatrix(pred.knn,   pred.rf)
+
+results$acc2 <-           (c(cm2.rpart$overall[1]
+                           , cm2.nnet$overall[1]
+                           , cm2.svm$overall[1]
+                           , cm2.gbm$overall[1]
+                           , cm2.lda$overall[1]
+                           , cm2.rf$overall[1]
+                           , cm2.knn$overall[1]
+                          ))
+
+names(results) <- c("Method", "Accuracy Test", "Accuracy Eval")
+results
+plot(results$`Accuracy Test`, results$`Accuracy Eval`, xlab="Accuracy with Test data", ylab="Accuracy with Verification data")
+textxy(results$`Accuracy Test`, results$`Accuracy Eval`, results$Method)
+abline(0,1)
+```
+
+As can be seen from the plot, there are some interesting differences in performance against the test and the validation data set. For the top performers in the previous section (rf, gbm and knn) the accuracy value has not changed much. 
+
+While the svmLinear method from the second group of average performers performed as expected, the neural network and linear discriminant analysis methods were much more accurate at predicting the outcome than before. As for the classifcation tree method, it did even worse than expected and got the majority of predicted outcomes wrong.
